@@ -122,7 +122,7 @@ let supabaseClient = null;
  const form=document.getElementById('loginForm'), message=document.getElementById('loginMessage'), screen=document.getElementById('loginScreen'), app=document.getElementById('mainApp');
  const configured=SUPABASE_URL.startsWith('https://') && SUPABASE_ANON_KEY.length>30 && !SUPABASE_URL.includes('COLE_') && !SUPABASE_ANON_KEY.includes('COLE_');
  document.getElementById('togglePassword').addEventListener('click',function(){const field=document.getElementById('loginPassword');field.type=field.type==='password'?'text':'password';this.setAttribute('aria-label',field.type==='password'?'Mostrar senha':'Ocultar senha');});
- function showSession(session){const loggedIn=!!session;screen.hidden=loggedIn;app.hidden=!loggedIn;if(loggedIn){message.textContent='';}}
+ function showSession(session){const loggedIn=!!session;screen.hidden=loggedIn;app.hidden=!loggedIn;if(loggedIn){message.textContent='';loadCloudDB().catch(err=>{console.error('Falha ao carregar dados do Supabase:',err);toast('Erro ao carregar dados do banco: '+(err.message||'verifique as permissões'));});}else{cloudLoadedUserId=null;}}
  document.getElementById('forgotPassword').addEventListener('click',async()=>{const email=document.getElementById('loginUser').value.trim();if(!configured){message.textContent='A configuração de autenticação ainda está pendente.';return;}if(!email.includes('@')){message.textContent='Digite seu e-mail no campo de usuário para receber o link de redefinição.';return;}try{const {error}=await supabaseClient.auth.resetPasswordForEmail(email,{redirectTo:location.origin+location.pathname});message.textContent=error?'Não foi possível enviar o e-mail. Confira o endereço e a configuração.':'Se o e-mail estiver cadastrado, você receberá instruções para redefinir a senha.';}catch(e){message.textContent='Não foi possível solicitar a redefinição agora.';}});
  form.addEventListener('submit',async function(e){e.preventDefault();if(!configured){message.textContent='Falta conectar o projeto Supabase. O login ainda não pode ser usado.';return;}if(!supabaseClient){message.textContent='O serviço de autenticação não carregou. Atualize a página e tente novamente.';return;}const email=document.getElementById('loginUser').value.trim(),password=document.getElementById('loginPassword').value;message.textContent='Verificando acesso…';let timer;try{const result=await Promise.race([supabaseClient.auth.signInWithPassword({email,password}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('A conexão com o Supabase demorou mais de 15 segundos. Verifique a conexão do navegador e tente novamente.')),15000);})]);clearTimeout(timer);const {data,error}=result;if(error){console.error('Supabase login:',error.status,error.message);message.textContent='Falha no login: '+error.message;return;}if(!data.session){message.textContent='A conta foi localizada, mas não foi criada uma sessão. Verifique a configuração de autenticação.';return;}showSession(data.session);}catch(err){clearTimeout(timer);console.error('Supabase connection:',err);message.textContent='Erro de conexão: '+(err&&err.message?err.message:'verifique a internet ou a configuração do projeto');}});
  if(!configured){message.textContent='Login preparado; falta conectar as credenciais públicas do projeto Supabase.';return;}
@@ -142,14 +142,49 @@ async function loadCloudDB(){
  if(cloudLoadedUserId===user.id)return;
  if(cloudLoadPromise)return cloudLoadPromise;
  cloudLoadPromise=(async()=>{
+  const local=loadDB();
   const [companiesResult,debtorsResult]=await Promise.all([
    supabaseClient.from('hort_companies').select('*').order('created_at',{ascending:true}),
    supabaseClient.from('hort_debtors').select('*').order('updated',{ascending:false})
   ]);
   if(companiesResult.error)throw companiesResult.error;
   if(debtorsResult.error)throw debtorsResult.error;
-  db.companies=companiesResult.data.map(c=>({id:c.id,name:c.name,doc:c.doc||'',phone:c.phone||'',notes:c.notes||''}));
-  db.debtors=debtorsResult.data.map(d=>({id:d.id,companyId:d.company_id,name:d.name,doc:d.doc||'',phone:d.phone||'',email:d.email||'',status:d.status||'Cadastro',value:Number(d.value||0),balance:Number(d.balance||0),entry:Number(d.entry||0),installments:Number(d.installments||0),paid:Number(d.paid||0),due:d.due||'',notes:d.notes||'',updated:d.updated||''}));
+  const cloudCompanies=companiesResult.data||[];
+  const cloudDebtors=debtorsResult.data||[];
+  const companyByName=new Map(cloudCompanies.map(c=>[String(c.name||'').trim().toLocaleLowerCase('pt-BR'),c]));
+  const companyIdMap=new Map();
+  const companiesToSave=[];
+  for(const c of local.companies||[]){
+   const existing=companyByName.get(String(c.name||'').trim().toLocaleLowerCase('pt-BR'));
+   if(existing){companyIdMap.set(c.id,existing.id);continue;}
+   const row={id:c.id||crypto.randomUUID(),user_id:user.id,name:c.name,doc:c.doc||null,phone:c.phone||null,notes:c.notes||null};
+   companyIdMap.set(c.id,row.id);companiesToSave.push(row);cloudCompanies.push(row);
+   companyByName.set(String(c.name||'').trim().toLocaleLowerCase('pt-BR'),row);
+  }
+  if(companiesToSave.length){
+   const {error}=await supabaseClient.from('hort_companies').upsert(companiesToSave,{onConflict:'id'});
+   if(error)throw error;
+  }
+  const cloudDebtorIds=new Set(cloudDebtors.map(d=>d.id));
+  const debtorsToSave=[];
+  for(const d of local.debtors||[]){
+   const mappedCompanyId=companyIdMap.get(d.companyId)||d.companyId;
+   if(!mappedCompanyId)continue;
+   const row={id:d.id||crypto.randomUUID(),user_id:user.id,company_id:mappedCompanyId,name:d.name,doc:d.doc||null,phone:d.phone||null,email:d.email||null,status:d.status||'Cadastro',value:Number(d.value||0),balance:Number(d.balance||0),entry:Number(d.entry||0),installments:Number(d.installments||0),paid:Number(d.paid||0),due:d.due||null,notes:d.notes||null,updated:d.updated||new Date().toISOString()};
+   if(!cloudDebtorIds.has(row.id))debtorsToSave.push(row);
+  }
+  if(debtorsToSave.length){
+   const {error}=await supabaseClient.from('hort_debtors').upsert(debtorsToSave,{onConflict:'id'});
+   if(error)throw error;
+  }
+  const [finalCompanies,finalDebtors]=await Promise.all([
+   supabaseClient.from('hort_companies').select('*').order('created_at',{ascending:true}),
+   supabaseClient.from('hort_debtors').select('*').order('updated',{ascending:false})
+  ]);
+  if(finalCompanies.error)throw finalCompanies.error;
+  if(finalDebtors.error)throw finalDebtors.error;
+  db.companies=(finalCompanies.data||[]).map(c=>({id:c.id,name:c.name,doc:c.doc||'',phone:c.phone||'',notes:c.notes||''}));
+  db.debtors=(finalDebtors.data||[]).map(d=>({id:d.id,companyId:d.company_id,name:d.name,doc:d.doc||'',phone:d.phone||'',email:d.email||'',status:d.status||'Cadastro',value:Number(d.value||0),balance:Number(d.balance||0),entry:Number(d.entry||0),installments:Number(d.installments||0),paid:Number(d.paid||0),due:d.due||'',notes:d.notes||'',updated:d.updated||''}));
   cloudLoadedUserId=user.id;localStorage.setItem(KEY,JSON.stringify(db));refreshAll();
  })();
  try{await cloudLoadPromise;}finally{cloudLoadPromise=null;}
@@ -162,7 +197,7 @@ function saveDB(){
   if(userError)throw userError;
   if(!userData.user)throw new Error('Sua sessão expirou. Entre novamente.');
   if(db.companies.length){
-   const rows=db.companies.map(c=>({id:c.id,name:c.name,doc:c.doc||null,phone:c.phone||null,notes:c.notes||null}));
+   const rows=db.companies.map(c=>({id:c.id,user_id:userData.user.id,name:c.name,doc:c.doc||null,phone:c.phone||null,notes:c.notes||null}));
    const {error}=await supabaseClient.from('hort_companies').upsert(rows,{onConflict:'id'});
    if(error)throw error;
   }
